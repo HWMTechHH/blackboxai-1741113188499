@@ -4,7 +4,7 @@ if (!defined('ABSPATH')) {
 }
 
 /**
- * Convert text to speech using PlayHT API
+ * Convert text to speech using PlayHT Streaming API
  * Based on: https://docs.play.ht/reference/api-getting-started
  */
 function smph_convert_post_to_audio($post_id) {
@@ -17,10 +17,10 @@ function smph_convert_post_to_audio($post_id) {
     $content = wp_strip_all_tags($post->post_content);
     $content = html_entity_decode($content);
 
-    // First, create a conversion
-    $create_conversion_url = 'https://play.ht/api/v2/tts';
+    // API endpoint for streaming
+    $api_url = 'https://api.play.ht/api/v2/tts/stream';
     
-    $response = wp_remote_post($create_conversion_url, array(
+    $response = wp_remote_post($api_url, array(
         'headers' => array(
             'Authorization' => 'Bearer ' . SMPH_PLAYHT_SECRET_ID,
             'X-User-ID' => SMPH_PLAYHT_USER_ID,
@@ -33,76 +33,55 @@ function smph_convert_post_to_audio($post_id) {
             'quality' => 'medium',
             'output_format' => 'mp3',
             'speed' => 1,
-            'sample_rate' => 24000
+            'sample_rate' => 24000,
+            'voice_engine' => 'PlayHT2.0', // Using PlayHT2.0 for better quality
+            'emotion' => 'neutral',
+            'voice_guidance' => 4, // Medium-high voice uniqueness
+            'style_guidance' => 15, // Medium emotion strength
+            'text_guidance' => 1.5 // Balance between fluidity and accuracy
         )),
-        'timeout' => 45
+        'timeout' => 45,
+        'stream' => true // Enable streaming response
     ));
 
     if (is_wp_error($response)) {
         return $response;
     }
 
-    $body = json_decode(wp_remote_retrieve_body($response), true);
-    
-    if (!isset($body['transcriptionId'])) {
+    $response_code = wp_remote_retrieve_response_code($response);
+    if ($response_code !== 200) {
+        $error_message = wp_remote_retrieve_response_message($response);
+        $body = json_decode(wp_remote_retrieve_body($response), true);
+        if (isset($body['error_message'])) {
+            $error_message = $body['error_message'];
+        }
         return new WP_Error(
-            'invalid_response', 
-            'Invalid response from PlayHT API: ' . wp_remote_retrieve_response_message($response)
+            'api_error',
+            sprintf('PlayHT API Error (%d): %s', $response_code, $error_message)
         );
     }
 
-    // Store the transcription ID in post meta for future reference
-    update_post_meta($post_id, '_smph_transcription_id', $body['transcriptionId']);
-
-    // Now get the audio URL
-    $get_audio_url = 'https://play.ht/api/v2/tts/' . $body['transcriptionId'];
+    // Get the audio content
+    $audio_content = wp_remote_retrieve_body($response);
     
-    $audio_response = wp_remote_get($get_audio_url, array(
-        'headers' => array(
-            'Authorization' => 'Bearer ' . SMPH_PLAYHT_SECRET_ID,
-            'X-User-ID' => SMPH_PLAYHT_USER_ID,
-            'Accept' => 'application/json'
-        )
-    ));
-
-    if (is_wp_error($audio_response)) {
-        return $audio_response;
+    // Generate a unique filename
+    $upload_dir = wp_upload_dir();
+    $filename = sprintf('playht-audio-%d-%s.mp3', $post_id, uniqid());
+    $filepath = $upload_dir['path'] . '/' . $filename;
+    
+    // Save the audio file
+    $saved = file_put_contents($filepath, $audio_content);
+    if ($saved === false) {
+        return new WP_Error('file_save_error', 'Failed to save audio file');
     }
 
-    $audio_body = json_decode(wp_remote_retrieve_body($audio_response), true);
+    // Get the URL for the saved file
+    $file_url = $upload_dir['url'] . '/' . $filename;
     
-    if (!isset($audio_body['audioUrl'])) {
-        return new WP_Error(
-            'invalid_audio_response', 
-            'Invalid audio response from PlayHT API'
-        );
-    }
-
     // Store the audio URL in post meta
-    update_post_meta($post_id, '_smph_audio_url', $audio_body['audioUrl']);
-
-    return $audio_body['audioUrl'];
-}
-
-/**
- * Check audio conversion status
- */
-function smph_check_conversion_status($transcription_id) {
-    $status_url = 'https://play.ht/api/v2/tts/' . $transcription_id;
+    update_post_meta($post_id, '_smph_audio_url', $file_url);
     
-    $response = wp_remote_get($status_url, array(
-        'headers' => array(
-            'Authorization' => 'Bearer ' . SMPH_PLAYHT_SECRET_ID,
-            'X-User-ID' => SMPH_PLAYHT_USER_ID,
-            'Accept' => 'application/json'
-        )
-    ));
-
-    if (is_wp_error($response)) {
-        return $response;
-    }
-
-    return json_decode(wp_remote_retrieve_body($response), true);
+    return $file_url;
 }
 
 /**
